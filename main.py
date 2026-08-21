@@ -38,7 +38,7 @@ def extraire_recette(request: VideoRequest):
 
         prompt = f'Analyse la vidéo et ce texte : "{desc[:500]}". Si pas une recette, réponds "PAS_UNE_RECETTE". Sinon, format : TITRE: ... INGRÉDIENTS: ... ÉTAPES: ...'
         response = client.models.generate_content(
-            model="gemini-2.0-flash", 
+            model="gemini-3.6-flash", 
             contents=[video_file, prompt],
             config=types.GenerateContentConfig(temperature=0.2, automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True))
         )
