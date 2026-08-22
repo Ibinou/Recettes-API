@@ -3,3 +3,5 @@ uvicorn
 yt-dlp
 google-genai
 pydantic
+requests
+beautifulsoup4
