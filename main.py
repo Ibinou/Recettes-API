@@ -5,6 +5,7 @@ import os
 import time
 import uuid
 import requests
+from bs4 import BeautifulSoup
 from google import genai
 from google.genai import types
 
@@ -13,9 +14,8 @@ app = FastAPI(title="API Recettes Ultimate")
 API_KEY = os.environ.get("GEMINI_API_KEY")
 client = genai.Client(api_key=API_KEY) if API_KEY else None
 
-# Nouveau modèle de données attendu par le serveur
 class ExtractRequest(BaseModel):
-    type: str # Peut être: "video_url", "image_url", "text", "tiktok_url"
+    type: str 
     content: str
 
 @app.post("/extraire")
@@ -28,10 +28,10 @@ def extraire_recette(request: ExtractRequest):
     
     try:
         contents = []
-        prompt = 'Analyse ce contenu. Si ce n\'est pas une recette, réponds "PAS_UNE_RECETTE". Sinon, extrais la recette (si c\'est une image, lis le texte dessus). Format attendu : TITRE: ... INGRÉDIENTS: ... ÉTAPES: ...'
+        prompt = 'Analyse ce contenu. Si ce n\'est pas une recette, réponds "PAS_UNE_RECETTE". Sinon, extrais la recette avec précision. Format attendu : TITRE: ... INGRÉDIENTS: ... ÉTAPES: ...'
 
-        # --- CAS 1 : C'EST UN LIEN VIDÉO TIKTOK (On utilise yt-dlp) ---
-        if request.type == "tiktok_url" or request.type == "video_url":
+        # 1. TIKTOK / VIDÉOS BRUTES (yt-dlp)
+        if request.type in ["tiktok_url", "video_url"]:
             temp_file += ".mp4"
             ydl_opts = {'format': 'worst', 'outtmpl': temp_file, 'quiet': True}
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -43,25 +43,29 @@ def extraire_recette(request: ExtractRequest):
                 uploaded_file = client.files.get(name=uploaded_file.name)
             contents = [uploaded_file, prompt]
 
-        # --- CAS 2 : C'EST UNE IMAGE PINTEREST/INSTA (Gemini Vision) ---
+        # 2. PINTEREST IMAGE 
         elif request.type == "image_url":
             temp_file += ".jpg"
-            # On télécharge l'image depuis le lien
             rep = requests.get(request.content, stream=True)
             with open(temp_file, 'wb') as f:
                 f.write(rep.content)
-            
             uploaded_file = client.files.upload(file=temp_file)
             contents = [uploaded_file, prompt]
 
-        # --- CAS 3 : C'EST UN SITE WEB (Texte extrait par l'iPhone) ---
-        elif request.type == "text":
-            contents = [f"{prompt}\n\nCONTENU DU SITE :\n{request.content[:30000]}"]
+        # 3. SITES WEB CLASSIQUES (Marmiton, Blogs)
+        elif request.type == "web_url":
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+            rep = requests.get(request.content, headers=headers, timeout=15)
+            soup = BeautifulSoup(rep.text, 'html.parser')
+            for element in soup(["script", "style", "nav", "footer", "header"]):
+                element.extract()
+            texte = soup.get_text(separator=' ', strip=True)
+            contents = [f"{prompt}\n\nCONTENU DU SITE :\n{texte[:30000]}"]
 
         else:
-            raise HTTPException(status_code=400, detail="Type de contenu non supporté.")
+            raise HTTPException(status_code=400, detail="Format non supporté.")
 
-        # --- GÉNÉRATION IA ---
+        # GÉNÉRATION
         response = client.models.generate_content(
             model="gemini-3.6-flash", 
             contents=contents,
@@ -72,18 +76,14 @@ def extraire_recette(request: ExtractRequest):
         if res == "PAS_UNE_RECETTE":
             return {"status": "error", "message": "Aucune recette trouvée dans ce contenu."}
             
-        # Extraction basique du titre (la première ligne du rendu)
         titre = res.split('\n')[0].replace("TITRE:", "").strip()
-        
         return {"status": "success", "titre": titre, "recette": res}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
         
     finally:
-        # Nettoyage
-        if os.path.exists(temp_file): 
-            os.remove(temp_file)
+        if os.path.exists(temp_file): os.remove(temp_file)
         if uploaded_file:
             try: client.files.delete(name=uploaded_file.name)
             except: pass
