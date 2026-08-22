@@ -8,6 +8,7 @@ import requests
 from bs4 import BeautifulSoup
 from google import genai
 from google.genai import types
+import gc # Le module de nettoyage de la mémoire
 
 app = FastAPI(title="API Recettes Ultimate")
 
@@ -30,10 +31,16 @@ def extraire_recette(request: ExtractRequest):
         contents = []
         prompt = 'Analyse ce contenu. Si ce n\'est pas une recette, réponds "PAS_UNE_RECETTE". Sinon, extrais la recette avec précision. Format attendu : TITRE: ... INGRÉDIENTS: ... ÉTAPES: ...'
 
-        # 1. TIKTOK / VIDÉOS BRUTES (yt-dlp)
+        # 1. TIKTOK / VIDÉOS BRUTES (Optimisation extrême de la RAM)
         if request.type in ["tiktok_url", "video_url"]:
             temp_file += ".mp4"
-            ydl_opts = {'format': 'worst', 'outtmpl': temp_file, 'quiet': True}
+            ydl_opts = {
+                'format': 'worst[ext=mp4]/worst', # La pire qualité possible
+                'outtmpl': temp_file,
+                'quiet': True,
+                'max_filesize': 25 * 1024 * 1024, # Coupe le téléchargement si > 25 Mo
+                'noplaylist': True
+            }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.extract_info(request.content, download=True)
             
@@ -48,7 +55,8 @@ def extraire_recette(request: ExtractRequest):
             temp_file += ".jpg"
             rep = requests.get(request.content, stream=True)
             with open(temp_file, 'wb') as f:
-                f.write(rep.content)
+                for chunk in rep.iter_content(chunk_size=8192): # Téléchargement par petits morceaux
+                    f.write(chunk)
             uploaded_file = client.files.upload(file=temp_file)
             contents = [uploaded_file, prompt]
 
@@ -83,7 +91,12 @@ def extraire_recette(request: ExtractRequest):
         raise HTTPException(status_code=500, detail=str(e))
         
     finally:
-        if os.path.exists(temp_file): os.remove(temp_file)
+        # NETTOYAGE AGRESSIF DE LA MÉMOIRE
+        if os.path.exists(temp_file): 
+            os.remove(temp_file)
         if uploaded_file:
             try: client.files.delete(name=uploaded_file.name)
             except: pass
+            
+        # On force Python à vider la RAM immédiatement
+        gc.collect()
