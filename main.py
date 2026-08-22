@@ -75,7 +75,7 @@ def extraire_recette(request: ExtractRequest):
 
         # GÉNÉRATION
         response = client.models.generate_content(
-            model="gemini-3.6-flash", 
+            model="gemini-3.1-flash-lite", 
             contents=contents,
             config=types.GenerateContentConfig(temperature=0.2, automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True))
         )
