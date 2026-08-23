@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 import yt_dlp
 import os
 import time
@@ -12,7 +12,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from google import genai
 from google.genai import types
-import gc  # Le module de nettoyage de la mémoire
+import gc
 
 app = FastAPI(title="API Recettes Ultimate")
 
@@ -21,8 +21,7 @@ client = genai.Client(api_key=API_KEY) if API_KEY else None
 
 
 # ============================================================
-#  OUTILS RÉSEAU — session réutilisable avec retries + headers
-#  qui imitent un vrai navigateur (évite pas mal de blocages)
+#  OUTILS RÉSEAU
 # ============================================================
 
 def build_session() -> requests.Session:
@@ -51,7 +50,6 @@ BROWSER_HEADERS = {
 
 
 def fetch_html(url: str, timeout: int = 15) -> str:
-    """Récupère le HTML d'une page en imitant un vrai navigateur, avec retries automatiques."""
     response = HTTP_SESSION.get(url, headers=BROWSER_HEADERS, timeout=timeout, allow_redirects=True)
     response.raise_for_status()
     return response.text
@@ -69,14 +67,11 @@ def download_file(url: str, path: str, referer: Optional[str] = None):
 
 
 # ============================================================
-#  EXTRACTION SCHEMA.ORG/RECIPE — la vraie amélioration robustesse
-#  Beaucoup de sites (Marmiton, 750g, blogs pro) exposent déjà
-#  leurs recettes dans ce format structuré, pour le SEO.
-#  C'est plus fiable, plus léger, et moins cher en tokens qu'un
-#  scraping brut de toute la page.
+#  EXTRACTION SCHEMA.ORG/RECIPE
 # ============================================================
 
-def extract_schema_recipe(soup: BeautifulSoup) -> Optional[str]:
+def extract_schema_recipe(soup: BeautifulSoup) -> Optional[dict]:
+    """Retourne un dict brut {titre, ingredients, etapes, image} si trouvé, sinon None."""
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(script.string)
@@ -84,8 +79,6 @@ def extract_schema_recipe(soup: BeautifulSoup) -> Optional[str]:
             continue
 
         candidates = data if isinstance(data, list) else [data]
-
-        # Certains sites imbriquent le Recipe dans un @graph
         flattened = []
         for item in candidates:
             if isinstance(item, dict) and "@graph" in item:
@@ -114,18 +107,33 @@ def extract_schema_recipe(soup: BeautifulSoup) -> Optional[str]:
                 elif isinstance(step, str):
                     etapes.append(step)
 
+            # L'image peut être une string, un dict ImageObject, ou une liste des deux
+            image = None
+            raw_image = item.get("image")
+            if isinstance(raw_image, str):
+                image = raw_image
+            elif isinstance(raw_image, dict):
+                image = raw_image.get("url")
+            elif isinstance(raw_image, list) and raw_image:
+                first = raw_image[0]
+                image = first if isinstance(first, str) else first.get("url")
+
             if titre and (ingredients or etapes):
-                texte = f"TITRE: {titre}\n\nINGRÉDIENTS:\n"
-                texte += "\n".join(f"- {i}" for i in ingredients)
-                texte += "\n\nÉTAPES:\n"
-                texte += "\n".join(f"{idx + 1}. {e}" for idx, e in enumerate(etapes))
-                return texte
+                return {
+                    "titre": titre,
+                    "ingredients": ingredients,
+                    "etapes": etapes,
+                    "image": image,
+                    "prep_time": item.get("prepTime"),
+                    "cook_time": item.get("cookTime"),
+                    "total_time": item.get("totalTime"),
+                    "portions": item.get("recipeYield"),
+                }
 
     return None
 
 
 def find_og_image(soup: BeautifulSoup) -> Optional[str]:
-    """Cherche l'image principale d'une page (utile pour Pinterest notamment)."""
     for prop in ["og:image:secure_url", "og:image"]:
         tag = soup.find("meta", property=prop)
         if tag and tag.get("content"):
@@ -133,18 +141,87 @@ def find_og_image(soup: BeautifulSoup) -> Optional[str]:
     return None
 
 
+# ============================================================
+#  MODÈLES — schéma que Gemini doit produire (sans l'image,
+#  qu'on renseigne nous-mêmes côté Python)
+# ============================================================
+
+class Ingredient(BaseModel):
+    nom: str
+    quantite: Optional[float] = None
+    unite: Optional[str] = None
+    emoji: Optional[str] = None
+
+
+class RecetteIA(BaseModel):
+    est_une_recette: bool
+    titre: Optional[str] = None
+    temps_preparation: Optional[int] = None  # en minutes
+    temps_cuisson: Optional[int] = None
+    temps_total: Optional[int] = None
+    portions_base: Optional[int] = None
+    ingredients: Optional[List[Ingredient]] = None
+    etapes: Optional[List[str]] = None
+
+
 class ExtractRequest(BaseModel):
     type: str
     content: str
+    source: Optional[str] = None   # ex: "TikTok", "Pinterest", "Web"... affiché tel quel dans l'UI
+    image: Optional[str] = None    # si le client a déjà une image sous la main (ex: poster vidéo)
 
 
 PROMPT_BASE = (
-    'Analyse ce contenu. Si ce n\'est pas une recette, réponds "PAS_UNE_RECETTE". '
-    'Sinon, extrais la recette avec précision, même si les informations sont éparpillées '
-    'ou incomplètes. Si c\'est la photo d\'un plat déjà terminé (pas de texte de recette), '
-    'identifie le plat et génère une recette plausible pour le refaire. '
-    'Format attendu : TITRE: ... INGRÉDIENTS: ... ÉTAPES: ...'
+    "Analyse ce contenu et réponds STRICTEMENT selon le schéma JSON demandé.\n"
+    "- Si ce n'est pas une recette, mets est_une_recette à false et laisse le reste vide.\n"
+    "- Sinon, extrais la recette avec précision, même si les informations sont éparpillées "
+    "ou incomplètes.\n"
+    "- Si c'est la photo d'un plat déjà terminé (pas de texte de recette), identifie le plat "
+    "et génère une recette plausible pour le refaire.\n"
+    "- temps_preparation / temps_cuisson / temps_total sont des NOMBRES DE MINUTES (entiers). "
+    "Convertis les durées ISO 8601 (ex: 'PT23M') ou les mentions textuelles ('20 min') en minutes. "
+    "Laisse null si vraiment introuvable.\n"
+    "- portions_base est le nombre de personnes pour lequel la recette est prévue à l'origine "
+    "(mets 4 par défaut si vraiment introuvable).\n"
+    "- Pour chaque ingrédient : quantite est un nombre (ou null si non quantifiable, ex: 'au goût'), "
+    "unite est une unité courte ('g', 'ml', 'cuillère à soupe'...) ou null pour les éléments comptables "
+    "(ex: 3 œufs -> quantite: 3, unite: null), emoji est UN SEUL emoji représentatif de l'ingrédient.\n"
+    "- etapes est une liste de chaînes de texte, une par étape, sans numérotation manuelle."
 )
+
+
+def _download_video(url: str, output_path: str) -> dict:
+    """Télécharge la vidéo et retourne les métadonnées yt-dlp (dont 'thumbnail')."""
+    ydl_opts = {
+        "format": "worst[ext=mp4]/worst",
+        "outtmpl": output_path,
+        "quiet": True,
+        "max_filesize": 25 * 1024 * 1024,
+        "noplaylist": True,
+        "http_headers": BROWSER_HEADERS,
+        "socket_timeout": 20,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+    return info or {}
+
+
+def _upload_and_wait(path: str):
+    uploaded = client.files.upload(file=path)
+    while uploaded.state.name == "PROCESSING":
+        time.sleep(2)
+        uploaded = client.files.get(name=uploaded.name)
+    return uploaded
+
+
+SOURCE_LABELS = {
+    "tiktok_url": "TikTok",
+    "pinterest_url": "Pinterest",
+    "video_url": "Instagram",
+    "image_url": "Image",
+    "web_url": "Web",
+    "text": "Texte",
+}
 
 
 @app.post("/extraire")
@@ -154,90 +231,106 @@ def extraire_recette(request: ExtractRequest):
 
     temp_file_path = None
     uploaded_file = None
+    image_finale = request.image  # priorité à l'image déjà fournie par le client
 
     try:
         contents = []
         base_name = f"fichier_{uuid.uuid4().hex}"
 
         # ------------------------------------------------------
-        # 1. TIKTOK / VIDÉOS DÉJÀ IDENTIFIÉES (ex: Instagram via WebView)
+        # 1. TIKTOK / VIDÉOS DÉJÀ IDENTIFIÉES (Instagram via WebView)
         # ------------------------------------------------------
         if request.type in ["tiktok_url", "video_url"]:
             temp_file_path = base_name + ".mp4"
-            _download_video(request.content, temp_file_path)
+            info = _download_video(request.content, temp_file_path)
+            if not image_finale:
+                image_finale = info.get("thumbnail")
             uploaded_file = _upload_and_wait(temp_file_path)
             contents = [uploaded_file, PROMPT_BASE]
 
         # ------------------------------------------------------
-        # 2. PINTEREST — géré entièrement côté serveur maintenant.
-        #    On tente d'abord la vidéo (yt-dlp la supporte nativement),
-        #    et si c'est un pin photo (pas de vidéo), on se rabat
-        #    automatiquement sur l'image principale de la page.
-        #    Plus besoin de passer par la WebView, donc plus fiable.
+        # 2. PINTEREST — vidéo en priorité, image en repli
         # ------------------------------------------------------
         elif request.type == "pinterest_url":
             try:
                 temp_file_path = base_name + ".mp4"
-                _download_video(request.content, temp_file_path)
+                info = _download_video(request.content, temp_file_path)
+                if not image_finale:
+                    image_finale = info.get("thumbnail")
                 uploaded_file = _upload_and_wait(temp_file_path)
                 contents = [uploaded_file, PROMPT_BASE]
             except yt_dlp.utils.DownloadError:
-                # Pas de vidéo trouvée -> c'est probablement un pin photo
                 if temp_file_path and os.path.exists(temp_file_path):
                     os.remove(temp_file_path)
 
                 html = fetch_html(request.content)
                 soup = BeautifulSoup(html, "html.parser")
-                image_url = find_og_image(soup)
+                pin_image = find_og_image(soup)
 
-                if not image_url:
+                if not pin_image:
                     return {
                         "status": "error",
                         "message": "Impossible de trouver une vidéo ou une image sur ce pin Pinterest.",
                     }
 
+                if not image_finale:
+                    image_finale = pin_image
+
                 temp_file_path = base_name + ".jpg"
-                download_file(image_url, temp_file_path, referer=request.content)
+                download_file(pin_image, temp_file_path, referer=request.content)
                 uploaded_file = client.files.upload(file=temp_file_path)
                 contents = [uploaded_file, PROMPT_BASE]
 
         # ------------------------------------------------------
-        # 3. IMAGE DIRECTE (ex: photo prise par l'utilisateur, ou
-        #    image déjà extraite côté client pour une autre plateforme)
+        # 3. IMAGE DIRECTE
         # ------------------------------------------------------
         elif request.type == "image_url":
+            if not image_finale:
+                image_finale = request.content
             temp_file_path = base_name + ".jpg"
             download_file(request.content, temp_file_path)
             uploaded_file = client.files.upload(file=temp_file_path)
             contents = [uploaded_file, PROMPT_BASE]
 
         # ------------------------------------------------------
-        # 4. TEXTE BRUT (collé par l'utilisateur, ou légende Instagram
-        #    récupérée en repli si aucune vidéo n'a été trouvée)
+        # 4. TEXTE BRUT
         # ------------------------------------------------------
         elif request.type == "text":
             contents = [f"{PROMPT_BASE}\n\nCONTENU :\n{request.content[:5000]}"]
 
         # ------------------------------------------------------
-        # 5. SITES WEB CLASSIQUES (Marmiton, blogs, etc.)
-        #    On cherche D'ABORD le JSON-LD schema.org/Recipe
-        #    (fiable, structuré, peu de tokens) avant de se rabattre
-        #    sur un scraping texte brut plus fragile.
+        # 5. SITES WEB CLASSIQUES
         # ------------------------------------------------------
         elif request.type == "web_url":
             html = fetch_html(request.content)
             soup = BeautifulSoup(html, "html.parser")
 
-            recette_structuree = extract_schema_recipe(soup)
-            if recette_structuree:
-                # On a des données propres et fiables : pas besoin de l'IA
-                # pour "deviner" la structure, juste pour vérifier/nettoyer.
+            schema = extract_schema_recipe(soup)
+            if schema:
+                if not image_finale:
+                    image_finale = schema.get("image")
+
+                texte_structure = f"TITRE: {schema['titre']}\n"
+                if schema.get("prep_time"):
+                    texte_structure += f"TEMPS DE PRÉPARATION (brut) : {schema['prep_time']}\n"
+                if schema.get("cook_time"):
+                    texte_structure += f"TEMPS DE CUISSON (brut) : {schema['cook_time']}\n"
+                if schema.get("total_time"):
+                    texte_structure += f"TEMPS TOTAL (brut) : {schema['total_time']}\n"
+                if schema.get("portions"):
+                    texte_structure += f"PORTIONS (brut) : {schema['portions']}\n"
+                texte_structure += "\nINGRÉDIENTS:\n" + "\n".join(f"- {i}" for i in schema["ingredients"])
+                texte_structure += "\n\nÉTAPES:\n" + "\n".join(schema["etapes"])
+
                 contents = [
-                    f"Voici une recette déjà structurée extraite du site. "
-                    f"Vérifie/nettoie le format sans inventer d'informations :\n\n{recette_structuree}"
+                    f"{PROMPT_BASE}\n\n"
+                    f"Voici une recette déjà structurée extraite du site (ne rien inventer, "
+                    f"juste convertir/nettoyer) :\n\n{texte_structure}"
                 ]
             else:
-                # Repli : scraping texte brut classique
+                if not image_finale:
+                    image_finale = find_og_image(soup)
+
                 for element in soup(["script", "style", "nav", "footer", "header", "aside"]):
                     element.extract()
                 texte = soup.get_text(separator=" ", strip=True)
@@ -257,22 +350,35 @@ def extraire_recette(request: ExtractRequest):
                 "message": "Impossible d'extraire un contenu exploitable depuis ce lien.",
             }
 
-        # GÉNÉRATION
+        # GÉNÉRATION — sortie JSON structurée, contrainte par le schéma RecetteIA
         response = client.models.generate_content(
             model="gemini-3.1-flash-lite",
             contents=contents,
             config=types.GenerateContentConfig(
                 temperature=0.2,
                 automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                response_mime_type="application/json",
+                response_schema=RecetteIA,
             ),
         )
 
-        res = response.text.strip()
-        if res == "PAS_UNE_RECETTE":
+        parsed = json.loads(response.text)
+
+        if not parsed.get("est_une_recette"):
             return {"status": "error", "message": "Aucune recette trouvée dans ce contenu."}
 
-        titre = res.split("\n")[0].replace("TITRE:", "").strip()
-        return {"status": "success", "titre": titre, "recette": res}
+        return {
+            "status": "success",
+            "titre": parsed.get("titre") or "Recette sans titre",
+            "source": request.source or SOURCE_LABELS.get(request.type, "Import"),
+            "image": image_finale,
+            "temps_preparation": parsed.get("temps_preparation"),
+            "temps_cuisson": parsed.get("temps_cuisson"),
+            "temps_total": parsed.get("temps_total"),
+            "portions_base": parsed.get("portions_base") or 4,
+            "ingredients": parsed.get("ingredients") or [],
+            "etapes": parsed.get("etapes") or [],
+        }
 
     except yt_dlp.utils.DownloadError:
         return {
@@ -298,30 +404,3 @@ def extraire_recette(request: ExtractRequest):
             except Exception:
                 pass
         gc.collect()
-
-
-# ============================================================
-#  HELPERS VIDÉO
-# ============================================================
-
-def _download_video(url: str, output_path: str):
-    ydl_opts = {
-        "format": "worst[ext=mp4]/worst",
-        "outtmpl": output_path,
-        "quiet": True,
-        "max_filesize": 25 * 1024 * 1024,
-        "noplaylist": True,
-        # Ces deux options aident yt-dlp à mieux passer certains blocages
-        "http_headers": BROWSER_HEADERS,
-        "socket_timeout": 20,
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.extract_info(url, download=True)
-
-
-def _upload_and_wait(path: str):
-    uploaded = client.files.upload(file=path)
-    while uploaded.state.name == "PROCESSING":
-        time.sleep(2)
-        uploaded = client.files.get(name=uploaded.name)
-    return uploaded
